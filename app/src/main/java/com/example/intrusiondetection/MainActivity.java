@@ -6,6 +6,8 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.widget.TextView;
 import android.graphics.Color;
 
@@ -22,27 +24,31 @@ import java.util.Date;
 
 public class MainActivity extends AppCompatActivity {
 
-    // ⚠️ Must match EXACTLY what you set in your ESP8266 code
-    private static final String MQTT_BROKER   = "tcp://broker.hivemq.com:1883";
-    private static final String MQTT_TOPIC    = "myproject/intrusiondetection"; // ← same as ESP8266
-    private static final String CLIENT_ID     = "androidClient_" + System.currentTimeMillis();
-    private static final String CHANNEL_ID    = "IntrusionAlerts";
+    private static final String MQTT_BROKER = "tcp://broker.hivemq.com:1883";
+    private static final String MQTT_TOPIC  = "myproject/intrusiondetection"; // ← same as ESP8266
+    private static final String CLIENT_ID   = "androidClient_" + System.currentTimeMillis();
+    private static final String CHANNEL_ID  = "IntrusionAlerts";
+
+    // ⏱️ How long before screen resets back to "All Clear" (5 seconds)
+    private static final int RESET_DELAY_MS = 5000;
 
     private TextView statusIcon, statusLabel, lastDetection, connectionStatus;
     private MqttClient mqttClient;
+
+    // Handler is used to schedule the "reset to all clear" after 5 seconds
+    private final Handler resetHandler = new Handler(Looper.getMainLooper());
+    private Runnable resetRunnable;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
-        // Get references to UI elements
         statusIcon       = findViewById(R.id.status_icon);
         statusLabel      = findViewById(R.id.status_label);
         lastDetection    = findViewById(R.id.last_detection);
         connectionStatus = findViewById(R.id.connection_status);
 
-        // Create notification channel (required for Android 8+)
         createNotificationChannel();
 
         // Connect to MQTT in background thread
@@ -57,6 +63,7 @@ public class MainActivity extends AppCompatActivity {
 
             mqttClient = new MqttClient(MQTT_BROKER, CLIENT_ID, new MemoryPersistence());
             mqttClient.setCallback(new MqttCallback() {
+
                 @Override
                 public void connectionLost(Throwable cause) {
                     updateConnectionStatus("● Disconnected", "#F44336");
@@ -64,11 +71,17 @@ public class MainActivity extends AppCompatActivity {
 
                 @Override
                 public void messageArrived(String topic, MqttMessage message) {
-                    // Motion detected! Update UI and show notification
                     String time = DateFormat.getDateTimeInstance().format(new Date());
                     String alertText = "Intrusion Detected @ " + time;
-                    updateUI(alertText);
+
+                    // 1. Update screen to red alert
+                    showIntrusionAlert(alertText);
+
+                    // 2. Fire push notification
                     showNotification("🚨 Intrusion Alert!", alertText);
+
+                    // 3. Reset screen back to All Clear after 5 seconds
+                    scheduleReset();
                 }
 
                 @Override
@@ -85,13 +98,35 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    private void updateUI(String message) {
+    // 🚨 Show red intrusion alert on screen
+    private void showIntrusionAlert(String message) {
         runOnUiThread(() -> {
             statusIcon.setText("🚨");
             statusLabel.setText("INTRUSION DETECTED");
             statusLabel.setTextColor(Color.parseColor("#C62828"));
             lastDetection.setText(message);
         });
+    }
+
+    // ✅ Reset screen back to normal "All Clear" state
+    private void showAllClear() {
+        runOnUiThread(() -> {
+            statusIcon.setText("🏠");
+            statusLabel.setText("All Clear");
+            statusLabel.setTextColor(Color.parseColor("#2E7D32"));
+            lastDetection.setText("No intrusion detected");
+        });
+    }
+
+    // ⏱️ Cancel any pending reset, then schedule a new one 5 seconds from now
+    private void scheduleReset() {
+        // Cancel previous reset if motion triggers again within 5 seconds
+        if (resetRunnable != null) {
+            resetHandler.removeCallbacks(resetRunnable);
+        }
+
+        resetRunnable = this::showAllClear;
+        resetHandler.postDelayed(resetRunnable, RESET_DELAY_MS);
     }
 
     private void updateConnectionStatus(String text, String colorHex) {
@@ -104,10 +139,14 @@ public class MainActivity extends AppCompatActivity {
     private void createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel channel = new NotificationChannel(
-                    CHANNEL_ID, "Intrusion Alerts",
+                    CHANNEL_ID,
+                    "Intrusion Alerts",
                     NotificationManager.IMPORTANCE_HIGH
             );
             channel.setDescription("Alerts when motion is detected");
+            channel.enableLights(true);
+            channel.setLightColor(Color.RED);
+            channel.enableVibration(true);
             NotificationManager manager = getSystemService(NotificationManager.class);
             manager.createNotificationChannel(channel);
         }
@@ -119,15 +158,22 @@ public class MainActivity extends AppCompatActivity {
                 .setContentTitle(title)
                 .setContentText(message)
                 .setPriority(NotificationCompat.PRIORITY_HIGH)
-                .setAutoCancel(true);
+                .setAutoCancel(true)
+                .setVibrate(new long[]{0, 500, 200, 500}); // vibrate pattern
 
-        NotificationManager manager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        NotificationManager manager =
+                (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         manager.notify(1, builder.build());
     }
 
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        // Clean up reset timer
+        if (resetRunnable != null) {
+            resetHandler.removeCallbacks(resetRunnable);
+        }
+        // Disconnect MQTT
         try {
             if (mqttClient != null && mqttClient.isConnected()) {
                 mqttClient.disconnect();
